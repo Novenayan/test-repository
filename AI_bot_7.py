@@ -1,22 +1,27 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+AI智能助手 - 集成RRF算法的混合搜索系统
+RRF算法融合ES内部的BM25和向量搜索结果，tavily由qwen-agent根据情况判断使用
+"""
 import os
-import re
-from qwen_agent.agents import Assistant
-from qwen_agent.gui import WebUI
-from qwen_agent.llm.oai import TextChatAtOAI
-from qwen_agent.tools.base import BaseTool, register_tool
 import json
+from typing import List, Dict, Any, Optional
+
+from qwen_agent.agents import Assistant
+from qwen_agent.llm.oai import TextChatAtOAI
+import re
 from elasticsearch import Elasticsearch
 from openai import OpenAI
 import tavily
 
-# Elasticsearch 配置
+# 配置常量
 ES_URL = 'https://127.0.0.1:9200'
 ES_USERNAME = 'elastic'
 ES_PASSWORD = 'u6jbCAwjf2oEjTOAXAJx'
 
 # Tavily 配置
 TAVILY_API_KEY = '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'
-tavily_client = tavily.TavilyClient(api_key=TAVILY_API_KEY)
 
 def connect_to_es():
     """连接到 Elasticsearch"""
@@ -47,7 +52,7 @@ def get_docs_files():
             if os.path.isfile(os.path.join(file_dir, f))]
 
 def hybrid_search(es, query, index_name='insurance_docs_chunks', size=5):
-    """并行混合搜索（关键词搜索 + 向量搜索）"""
+    """改进的混合搜索（关键词搜索 + 向量搜索）使用RRF算法融合"""
     try:
         # 初始化 OpenAI 客户端用于查询 embedding
         api_key = os.getenv("AGI_API_KEY_GEN")
@@ -62,14 +67,6 @@ def hybrid_search(es, query, index_name='insurance_docs_chunks', size=5):
                         "type": "best_fields"
                     }
                 },
-                "highlight": {
-                    "fields": {
-                        "content": {
-                            "fragment_size": 150,
-                            "number_of_fragments": 3
-                        }
-                    }
-                },
                 "size": size,
                 "_source": ["title", "content", "file_path", "file_name", "page_num"]  # 确保返回所有需要的字段
             }
@@ -79,7 +76,6 @@ def hybrid_search(es, query, index_name='insurance_docs_chunks', size=5):
 
         # 检查API连接性
         try:
-            from openai import OpenAI
             embedding_client = OpenAI(
                 api_key=api_key,
                 base_url="https://api.siliconflow.cn/v1"
@@ -93,14 +89,6 @@ def hybrid_search(es, query, index_name='insurance_docs_chunks', size=5):
                         "query": query,
                         "fields": ["title^2", "content"],  # 标题权重更高
                         "type": "best_fields"
-                    }
-                },
-                "highlight": {
-                    "fields": {
-                        "content": {
-                            "fragment_size": 150,
-                            "number_of_fragments": 3
-                        }
                     }
                 },
                 "size": size,
@@ -135,14 +123,6 @@ def hybrid_search(es, query, index_name='insurance_docs_chunks', size=5):
                         "type": "best_fields"
                     }
                 },
-                "highlight": {
-                    "fields": {
-                        "content": {
-                            "fragment_size": 150,
-                            "number_of_fragments": 3
-                        }
-                    }
-                },
                 "size": size,
                 "_source": ["title", "content", "file_path", "file_name", "page_num"]  # 确保返回所有需要的字段
             }
@@ -150,49 +130,45 @@ def hybrid_search(es, query, index_name='insurance_docs_chunks', size=5):
             response = es.search(index=index_name, body=search_body)
             return response
 
-        # 并行混合搜索：使用 bool 查询组合关键词搜索和向量搜索
-        search_body = {
+        # 执行关键词搜索
+        keyword_search_body = {
             "query": {
-                "bool": {
-                    "should": [
-                        # 关键词匹配
-                        {
-                            "multi_match": {
-                                "query": query,
-                                "fields": ["title^2", "content"],
-                                "type": "best_fields",
-                                "boost": 0.5  # 关键词搜索权重
-                            }
-                        },
-                        # 向量搜索（kNN）
-                        {
-                            "script_score": {
-                                "query": {"match_all": {}},
-                                "script": {
-                                    "source": "cosineSimilarity(params.query_vector, 'content_vector') + 1.0",
-                                    "params": {
-                                        "query_vector": query_embedding
-                                    }
-                                }
-                            }
-                        }
-                    ]
+                "multi_match": {
+                    "query": query,
+                    "fields": ["title^2", "content"],
+                    "type": "best_fields",
                 }
             },
-            "highlight": {
-                "fields": {
-                    "content": {
-                        "fragment_size": 150,
-                        "number_of_fragments": 3
+            "size": size * 2,  # 获取更多结果用于RRF融合
+            "_source": ["title", "content", "file_path", "file_name", "page_num"],
+        }
+        
+        keyword_response = es.search(index=index_name, body=keyword_search_body)
+        
+        # 执行向量搜索（kNN）
+        vector_search_body = {
+            "query": {
+                "script_score": {
+                    "query": {"match_all": {}},
+                    "script": {
+                        "source": "cosineSimilarity(params.query_vector, 'content_vector') + 1.0",
+                        "params": {
+                            "query_vector": query_embedding
+                        }
                     }
                 }
             },
-            "size": size,
-            "_source": ["title", "content", "file_path", "file_name", "page_num"]  # 确保返回所有需要的字段
+            "size": size * 2,  # 获取更多结果用于RRF融合
+            "_source": ["title", "content", "file_path", "file_name", "page_num"],
         }
         
-        response = es.search(index=index_name, body=search_body)
-        return response
+        vector_response = es.search(index=index_name, body=vector_search_body)
+        
+        # 使用RRF算法融合两种搜索结果
+        rrf_fused_results = rrf_fusion(keyword_response, vector_response, k=60, top_k=size)
+        
+        return rrf_fused_results
+        
     except Exception as e:
         print(f"混合搜索时出错: {e}")
         # 如果混合搜索完全失败，尝试纯关键词搜索
@@ -205,14 +181,6 @@ def hybrid_search(es, query, index_name='insurance_docs_chunks', size=5):
                         "type": "best_fields"
                     }
                 },
-                "highlight": {
-                    "fields": {
-                        "content": {
-                            "fragment_size": 150,
-                            "number_of_fragments": 3
-                        }
-                    }
-                },
                 "_source": ["title", "content", "file_path", "file_name", "page_num"],  # 确保返回所有需要的字段
                 "size": size
             }
@@ -222,8 +190,80 @@ def hybrid_search(es, query, index_name='insurance_docs_chunks', size=5):
         except Exception as e2:
             print(f"纯关键词搜索也失败: {e2}")
             return None
+
+def rrf_fusion(keyword_response, vector_response, k=60, top_k=5):
+    """
+    使用RRF (Reciprocal Rank Fusion) 算法融合关键词搜索和向量搜索结果
+    算法参考：对多个搜索引擎的结果进行融合，使用公式 1/(rank + k) 计算分数
+    
+    Args:
+        keyword_response: 关键词搜索的ES响应
+        vector_response: 向量搜索的ES响应
+        k: RRF公式中的平滑参数，默认60
+        top_k: 返回的top结果数量
+    
+    Returns:
+        融合后的ES响应，格式与单个搜索响应一致
+    """
+    try:
+        keyword_hits = keyword_response['hits']['hits']
+        vector_hits = vector_response['hits']['hits']
+        
+        # 创建文档ID到原始hit的映射
+        all_hits_map = {}
+        for hit in keyword_hits + vector_hits:
+            doc_id = hit['_id']
+            if doc_id not in all_hits_map:
+                all_hits_map[doc_id] = hit
+        
+        # 计算RRF分数 - 算法核心逻辑实现
+        rrf_scores = {}
+        
+        # 为关键词搜索结果分配分数 (使用公式 1/(rank + k))
+        for rank, hit in enumerate(keyword_hits):
+            doc_id = hit['_id']
+            # RRF公式: 1 / (rank + k)，rank从1开始
+            rrf_score = 1.0 / (rank + 1 + k)
+            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + rrf_score
+        
+        # 为向量搜索结果分配分数 (使用公式 1/(rank + k))
+        for rank, hit in enumerate(vector_hits):
+            doc_id = hit['_id']
+            # RRF公式: 1 / (rank + k)，rank从1开始
+            rrf_score = 1.0 / (rank + 1 + k)
+            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + rrf_score
+        
+        # 按RRF分数排序 (按融合后的分数重新排序)
+        sorted_doc_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+        
+        # 重新构建hits列表，按照RRF排序
+        fused_hits = []
+        for doc_id in sorted_doc_ids[:top_k]:
+            hit = all_hits_map[doc_id].copy()
+            # 使用RRF分数作为_score
+            hit['_score'] = rrf_scores[doc_id]
+            fused_hits.append(hit)
+        
+        # 构建融合后的响应
+        fused_response = {
+            'hits': {
+                'hits': fused_hits,
+                'total': {'value': len(fused_hits), 'relation': 'eq'}
+            }
+        }
+        
+        print(f"RRF融合完成，共融合了 {len(keyword_hits)} 个关键词搜索结果和 {len(vector_hits)} 个向量搜索结果")
+        return fused_response
+        
+    except Exception as e:
+        print(f"RRF融合过程中出错: {e}")
+        import traceback
+        traceback.print_exc()
+        # 出错时回退到关键词搜索结果
+        return keyword_response
+
 def retrieve_from_es(es, query):
-    """从ES检索相关文档（使用混合搜索）"""
+    """从ES检索相关文档（使用改进的混合搜索）"""
     if not es:
         return []
     
@@ -236,15 +276,7 @@ def retrieve_from_es(es, query):
     
     for hit in hits:
         source = hit['_source']
-        # 移除高亮标签
-        if 'highlight' in hit:
-            highlights = hit['highlight'].get('content', [])
-            if highlights:
-                clean_content = re.sub(r'<[^>]+>', '', highlights[0])
-            else:
-                clean_content = source.get('content', '')
-        else:
-            clean_content = source.get('content', '')
+        clean_content = source.get('content', '')
         
         retrieved_docs.append({
             'title': source.get('title', ''),
@@ -257,26 +289,16 @@ def retrieve_from_es(es, query):
     
     return retrieved_docs
 
-def get_docs_files():
-    """获取docs目录下的所有文件"""
-    file_dir = './docs'
-    if not os.path.exists(file_dir):
-        return []
-    return [os.path.join(file_dir, f) for f in os.listdir(file_dir) 
-            if os.path.isfile(os.path.join(file_dir, f))]
-
 def init_agent_service(es=None):
     """初始化智能体服务"""
     files = get_docs_files()
     print('files=', files)
 
     # 配置 LLM - 优先使用环境变量AGI_API_KEY_GEN，如果不存在则使用默认值
-    api_key = os.getenv('AGI_API_KEY_GEN')
-    if not api_key:
-        print("警告: 未设置 AGI_API_KEY_GEN 环境变量")
-        print("提示: 建议设置环境变量以获得更好的安全性")
-        print("设置方法: set AGI_API_KEY_GEN=your_api_key_here")
-        api_key = "sk-ykjwinvuaqujgipblcfnbvbacauqxpgxpqzkjzuezwolpcxr"  # 测试用密钥
+    api_key = os.getenv('AGI_API_KEY_GEN', 'sk-ykjwinvuaqujgipblcfnbvbacauqxpgxpqzkjzuezwolpcxr')
+    
+    if api_key == 'sk-ykjwinvuaqujgipblcfnbvbacauqxpgxpqzkjzuezwolpcxr':
+        print("警告: 使用了默认API密钥，建议设置环境变量以获得更好的安全性")
     else:
         print("已使用环境变量中的API密钥")
     
@@ -293,17 +315,17 @@ def init_agent_service(es=None):
 你的回答应当专业、准确、有帮助。
 
 重要指令：
-1. 当用户提出问题时，你必须首先查看是否已提供相关文档内容
+1. 当用户提出问题时，优先查看是否已提供相关文档内容
 2. 对于保险相关问题，优先基于已提供的保险文档进行回答
-3. 只有在已提供文档无法回答问题时，才考虑其他方式
-4. 绝不允许在有相关文档的情况下忽略文档而去网络搜索
-5. 回答问题时务必引用文档来源（文件名、页码等信息）
+3. 当本地文档无法充分回答问题时，可以使用网络搜索获取补充信息
+4. 智能判断何时使用本地文档、何时使用网络搜索：对于具体的保险条款、产品细节，优先使用本地文档；对于需要时效性信息、行业新闻或无法在本地文档中找到的问题，可使用网络搜索
+5. 回答问题时尽量引用文档来源（文件名、页码等信息），若使用网络信息则说明信息来源
 '''
     
     # 如果ES连接成功，修改system_instruction以包含检索信息
     if es:
         system_instruction += '''
-        系统已经为你检索了相关文档，请基于这些文档内容回答用户的问题。
+        系统已经为你检索了相关文档，文档内容已添加到上下文中，请根据需要使用这些信息回答用户的问题。
         '''
     
     # 尝试初始化LLM，如果失败则给出错误信息
@@ -342,9 +364,10 @@ def init_agent_service(es=None):
             llm = MockLLM(llm_cfg_fallback)
             print("已创建模拟LLM客户端以避免程序崩溃")
     
-    # 我们已经在custom_webui.py中实现了ES检索功能，不需要Tavily工具
-    # 只保留code_interpreter工具
-    kwargs = {'llm': llm, 'system_message': system_instruction, 'function_list': ['code_interpreter']}
+    # 导入Tavily工具以确保其被注册
+    import search_tools
+    # 恢复Tavily工具，让系统能够智能判断何时使用ES数据库、何时使用网络搜索
+    kwargs = {'llm': llm, 'system_message': system_instruction, 'function_list': ['tavily_search', 'code_interpreter']}
     if files:
         kwargs['files'] = files
     
@@ -353,70 +376,6 @@ def init_agent_service(es=None):
     assistant.name = '涅槃搜索'  # 确保助手名称是'涅槃搜索'
     
     return assistant, es
-
-def app_tui():
-    """终端交互模式"""
-    try:
-        # 连接到ES
-        es = connect_to_es()
-        
-        # 初始化助手
-        bot, es = init_agent_service(es)
-        messages = []
-        
-        while True:
-            try:
-                query = input('user question: ')
-                file_input = input('file url (press enter if no file): ').strip()
-                
-                if not query:
-                    print('user question cannot be empty！')
-                    continue
-                
-                # 如果ES连接成功，先检索相关文档
-                retrieved_docs = []
-                if es:
-                    print(f"正在检索与 '{query}' 相关的文档...")
-                    retrieved_docs = retrieve_from_es(es, query)
-                    if retrieved_docs:
-                        print(f"找到 {len(retrieved_docs)} 个相关文档:")
-                        for i, doc in enumerate(retrieved_docs):
-                            print(f"  {i+1}. {doc['title']} (页码: {doc['page_num']}, 相关性: {doc['score']:.2f})")
-                            print(f"     内容预览: {doc['content'][:100]}...")
-                    else:
-                        print("未找到相关文档")
-                
-                # 构建消息
-                if not file_input:
-                    messages.append({'role': 'user', 'content': query})
-                else:
-                    messages.append({'role': 'user', 'content': [{'text': query}, {'file': file_input}]})
-
-                print("正在处理您的请求...")
-                
-                # 如果有检索到的文档，添加到系统消息中
-                if retrieved_docs:
-                    context = "以下是检索到的相关文档内容：\n\n"
-                    for doc in retrieved_docs:
-                        context += f"文档: {doc['title']}, 页码: {doc['page_num']}\n内容: {doc['content']}\n\n"
-                    
-                    # 在消息中加入检索到的上下文
-                    if messages and messages[0]['role'] == 'system':
-                        messages[0]['content'] += f"\n\n{context}"
-                    else:
-                        messages = [{'role': 'system', 'content': context}] + messages
-                
-                for response in bot.run(messages):
-                    print('bot response:', response)
-                messages.extend(response)
-            except KeyboardInterrupt:
-                print("\n程序已退出")
-                break
-            except Exception as e:
-                print(f"处理请求时出错: {str(e)}")
-                print("请重试或输入新的问题")
-    except Exception as e:
-        print(f"启动终端模式失败: {str(e)}")
 
 def app_gui():
     """图形界面模式"""
@@ -429,7 +388,7 @@ def app_gui():
         # 初始化助手
         bot, es = init_agent_service(es)
         
-        # 配置聊天界面，列举3个典型保险查询问题
+        # 配置聊天界面，列举典型保险查询问题
         chatbot_config = {
             'prompt.suggestions': [
                 '介绍下雇主责任险',
@@ -442,7 +401,6 @@ def app_gui():
             ],
             'agent.name': '涅槃搜索',
             'agent.description': '涅槃搜索 - 专业的智能搜索助手',
-            'agent.avatar': None  # 确保不使用默认头像
         }
         print("Web 界面准备就绪，正在启动服务...")
         
@@ -459,66 +417,6 @@ def app_gui():
         print(f"启动 Web 界面失败: {str(e)}")
         print("请检查网络连接和硅基流动API Key配置")
 
-import time
-import threading
-
-def get_user_choice_with_timeout():
-    """
-    获取用户选择，如果2秒内没有输入则使用默认选择
-    使用更简单的方式避免线程问题
-    """
-    import sys
-    import select
-    
-    print("选择运行模式 (2秒后将自动选择默认选项):")
-    print("1: GUI模式 (Web界面)")
-    print("2: TUI模式 (终端交互)")
-    print("请输入选择 (1 或 2，默认为 1): ", end='', flush=True)
-    
-    # 在Windows上使用msvcrt实现非阻塞输入
-    try:
-        import msvcrt
-        import time
-        
-        start_time = time.time()
-        user_input = ""
-        
-        while time.time() - start_time < 2:
-            if msvcrt.kbhit():
-                char = msvcrt.getch().decode('utf-8')
-                if char in ['1', '2', '\r', '\n']:
-                    if char in ['1', '2']:
-                        user_input += char
-                        print(char, end='', flush=True)
-                    elif char in ['\r', '\n'] and user_input:
-                        print()  # 换行
-                        break
-                elif char == '\b':  # 退格键
-                    if user_input:
-                        user_input = user_input[:-1]
-                        print('\b \b', end='', flush=True)
-            time.sleep(0.01)  # 短暂休眠，避免CPU占用过高
-        
-        if user_input:
-            if user_input in ['1', '2']:
-                return user_input
-            else:
-                print(f"\n无效输入 '{user_input}'，使用默认选项 (GUI模式)")
-                return "1"
-        else:
-            print("\n2秒内未收到选择，使用默认选项 (GUI模式)")
-            return "1"
-    except ImportError:
-        # 如果不是Windows系统或msvcrt不可用，使用简单方式
-        print("\n系统不支持非阻塞输入，使用默认选项 (GUI模式)")
-        return "1"
-
 if __name__ == '__main__':
-    try:
-        choice = get_user_choice_with_timeout()
-        if choice == "2":
-            app_tui()
-        else:
-            app_gui()
-    except:
-        app_gui()  # 默认启动GUI模式
+    print("正在启动 WebUI 模式...")
+    app_gui()
